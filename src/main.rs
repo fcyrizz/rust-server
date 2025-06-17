@@ -1,10 +1,11 @@
-use axum::{extract::Path, routing::get, Json, Router};
-use once_cell::sync::Lazy;
+use hyper::{Body, Request, Response, Server, Method, StatusCode};
+use hyper::service::{make_service_fn, service_fn};
 use redb::{Database, ReadableTable, TableDefinition};
-use serde::{Deserialize, Serialize};
-use std::{fs, net::SocketAddr, path::Path as FsPath};
-use tokio::net::TcpListener;
+use once_cell::sync::Lazy;
+use serde::{Serialize, Deserialize};
+use std::{convert::Infallible, net::SocketAddr};
 
+// Define your user struct
 #[derive(Serialize, Deserialize, Debug)]
 struct User {
     id: u32,
@@ -13,41 +14,62 @@ struct User {
     created_at: String,
 }
 
-// Define the table
+// Define REDB table
 static USER_TABLE: TableDefinition<u32, &str> = TableDefinition::new("user");
 
-// Lazy load the Redb database
+// Lazy-init REDB instance
 static DB: Lazy<Database> = Lazy::new(|| {
-    let db_path = "./zrqn.redb";
-
-    // Ensure parent dir exists
-    if let Some(parent) = FsPath::new(db_path).parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-
-    Database::create(db_path).expect("Failed to create or open Redb database")
+    Database::create("zrqn.redb").expect("Failed to create/open Redb")
 });
 
-async fn get_user(Path(id): Path<u32>) -> Json<Option<User>> {
-    let db = &*DB;
+async fn router(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+    match (req.method(), req.uri().path()) {
+        (&Method::GET, path) if path.starts_with("/user/") => {
+            // Extract user ID from path
+            let id_part = path.trim_start_matches("/user/");
+            if let Ok(id) = id_part.parse::<u32>() {
+                let read_txn = DB.begin_read().unwrap();
+                let table = read_txn.open_table(USER_TABLE).unwrap();
 
-    let read_txn = db.begin_read().unwrap();
-    let table = read_txn.open_table(USER_TABLE).unwrap();
+                if let Some(val) = table.get(&id).unwrap() {
+                    if let Ok(user) = serde_json::from_str::<User>(val.value()) {
+                        let json = serde_json::to_string(&user).unwrap();
+                        return Ok(Response::new(Body::from(json)));
+                    }
+                }
+                Ok(not_found())
+            } else {
+                Ok(bad_request())
+            }
+        }
 
-    let result = table.get(&id).unwrap().map(|entry| {
-        let json_str = entry.value();
-        serde_json::from_str::<User>(json_str).ok()
-    }).flatten();
+        _ => Ok(not_found()),
+    }
+}
 
-    Json(result)
+fn not_found() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"error":"User not found"}"#))
+        .unwrap()
+}
+
+fn bad_request() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"error":"Invalid user ID"}"#))
+        .unwrap()
 }
 
 #[tokio::main]
 async fn main() {
-    let app = Router::new().route("/user/:id", get(get_user));
-
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    let listener = TcpListener::bind(addr).await.unwrap();
-    println!("🚀 Server listening at http://{}", addr);
-    axum::serve(listener, app).await.unwrap();
+    let make_svc = make_service_fn(|_conn| async {
+        Ok::<_, Infallible>(service_fn(router))
+    });
+
+    println!("🚀 Hyper server running at http://{}", addr);
+    Server::bind(&addr).serve(make_svc).await.unwrap();
 }
