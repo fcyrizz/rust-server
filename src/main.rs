@@ -3,9 +3,10 @@ use hyper::service::{make_service_fn, service_fn};
 use redb::{Database, ReadableTable, TableDefinition};
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
-use std::{convert::Infallible, net::SocketAddr};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc};
+use tokio::task;
 
-// Define your user struct
+// User model
 #[derive(Serialize, Deserialize, Debug)]
 struct User {
     id: u32,
@@ -14,25 +15,28 @@ struct User {
     created_at: String,
 }
 
-// Define REDB table
+// REDB table definition
 static USER_TABLE: TableDefinition<u32, &str> = TableDefinition::new("user");
 
-// Lazy-init REDB instance
-static DB: Lazy<Database> = Lazy::new(|| {
-    Database::create("zrqn.redb").expect("Failed to create/open Redb")
+// Shared global DB handle using Arc
+static DB: Lazy<Arc<Database>> = Lazy::new(|| {
+    Arc::new(Database::create("zrqn.redb").expect("Failed to open Redb"))
 });
 
 async fn router(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, path) if path.starts_with("/user/") => {
-            // Extract user ID from path
             let id_part = path.trim_start_matches("/user/");
             if let Ok(id) = id_part.parse::<u32>() {
-                let read_txn = DB.begin_read().unwrap();
-                let table = read_txn.open_table(USER_TABLE).unwrap();
+                let db = DB.clone();
+                let result = task::spawn_blocking(move || {
+                    let txn = db.begin_read().unwrap();
+                    let table = txn.open_table(USER_TABLE).unwrap();
+                    table.get(&id).ok().flatten().map(|val| val.value().to_owned())
+                }).await.unwrap();
 
-                if let Some(val) = table.get(&id).unwrap() {
-                    if let Ok(user) = serde_json::from_str::<User>(val.value()) {
+                if let Some(raw_str) = result {
+                    if let Ok(user) = serde_json::from_str::<User>(&raw_str) {
                         let json = serde_json::to_string(&user).unwrap();
                         return Ok(Response::new(Body::from(json)));
                     }
@@ -42,7 +46,6 @@ async fn router(req: Request<Body>) -> Result<Response<Body>, Infallible> {
                 Ok(bad_request())
             }
         }
-
         _ => Ok(not_found()),
     }
 }
@@ -63,7 +66,7 @@ fn bad_request() -> Response<Body> {
         .unwrap()
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     let make_svc = make_service_fn(|_conn| async {
