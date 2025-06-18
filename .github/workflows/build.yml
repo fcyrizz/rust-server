@@ -1,0 +1,36 @@
+name: Build Alpine Binary
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ⬇️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🦀 Set up Rust with musl
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: 📦 Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y musl-tools upx
+
+      - name: 🔨 Build static binary for Alpine
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          strip target/x86_64-unknown-linux-musl/release/rzn
+          upx --best target/x86_64-unknown-linux-musl/release/rzn
+
+      - name: 📤 Upload binary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rzn
+          path: target/x86_64-unknown-linux-musl/release/rzn
